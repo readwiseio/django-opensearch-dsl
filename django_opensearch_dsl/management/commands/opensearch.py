@@ -133,7 +133,7 @@ class Command(BaseCommand):
                     self.stdout.write(f"{pp} index '{index._name}'... {self.style.SUCCESS('OK')}")  # noqa
 
     def _manage_document(
-        self, action, indices, force, filters, excludes, verbosity, parallel, count, refresh, missing, **options
+        self, action, indices, force, filters, excludes, verbosity, parallel, refresh, missing, **options
     ):  # noqa
         """Manage the creation and deletion of indices."""
         action = OpensearchAction(action)
@@ -174,8 +174,8 @@ class Command(BaseCommand):
 
             document = index._doc_types[0]()  # noqa
             try:
-                kwargs_list.append({"filter_": filter_, "exclude": exclude_, "count": count})
-                qs = document.get_queryset(filter_=filter_, exclude=exclude_, count=count).count()
+                kwargs_list.append({"filter_": filter_, "exclude": exclude_})
+                qs = document.get_count(filter_=filter_, exclude=exclude_)
             except FieldError as e:
                 model = index._doc_types[0].django.model.__name__  # noqa
                 self.stderr.write(f"Error while filtering on '{model}' (from index '{index._name}'):\n{e}'")  # noqa
@@ -320,9 +320,6 @@ class Command(BaseCommand):
         subparser.add_argument("--force", action="store_true", default=False, help="Do not ask for confirmation.")
         subparser.add_argument(
             "-i", "--indices", type=str, nargs="*", help="Only update documents on the given indices."
-        )
-        subparser.add_argument(
-            "-c", "--count", type=int, default=None, help="Update at most COUNT objects (0 to index everything)."
         )
         subparser.add_argument(
             "-p",

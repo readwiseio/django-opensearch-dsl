@@ -70,20 +70,31 @@ class Document(DSLDocument):
     def get_queryset(
         self,
         filter_: Optional[Q] = None,
-        exclude: Optional[Q] = None,
-        count: int = None,
+        exclude: Optional[Q] = None
     ) -> QuerySet:
         """Return the queryset that should be indexed by this doc type."""
-        qs = self.django.model.objects.all()
+        qs = self.django.model.objects.iterator(chunk_size=10_000)
 
         if filter_:
             qs = qs.filter(filter_)
         if exclude:
             qs = qs.exclude(exclude)
-        if count is not None:
-            qs = qs[:count]
 
         return qs
+
+    def get_count(
+        self,
+        filter_: Optional[Q] = None,
+        exclude: Optional[Q] = None
+    ) -> int:
+        qs = self.django.model.objects
+
+        if filter_:
+            qs = qs.filter(filter_)
+        if exclude:
+            qs = qs.exclude(exclude)
+
+        return qs.count()
 
     def _eta(self, start, done, total):  # pragma: no cover
         if done == 0:
@@ -100,15 +111,13 @@ class Document(DSLDocument):
         verbose: bool = False,
         filter_: Optional[Q] = None,
         exclude: Optional[Q] = None,
-        count: int = None,
         action: OpensearchAction = OpensearchAction.INDEX,
         stdout: io.FileIO = sys.stdout,
     ) -> Iterable:
         """Divide the queryset into chunks."""
         chunk_size = self.django.queryset_pagination
-        qs = self.get_queryset(filter_=filter_, exclude=exclude, count=count)
-        qs = qs.order_by("pk") if not qs.query.is_sliced else qs
-        count = qs.count()
+        qs = self.get_queryset(filter_=filter_, exclude=exclude)
+        count = self.get_count(filter_=filter_, exclude=exclude)
         model = self.django.model.__name__
         action = action.present_participle.title()
 
@@ -121,11 +130,10 @@ class Document(DSLDocument):
             if verbose:
                 stdout.write(f"{action} {model}: {round(i / count * 100)}% ({self._eta(start, done, count)})\r")
 
-            for obj in qs[i : i + chunk_size]:
+            for obj in qs:
                 done += 1
                 yield obj
-
-            i = min(i + chunk_size, count)
+                i += 1
 
         if verbose:
             stdout.write(f"{action} {count} {model}: OK          \n")
