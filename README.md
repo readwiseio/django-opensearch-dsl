@@ -122,3 +122,50 @@ class CarDocument(Document):
         # This per-Document setting overrides settings.OPENSEARCH_DSL_QUERYSET_PAGINATION.
         queryset_pagination = 5000
 ```
+
+## Zero-Downtime Reindexing with Aliases
+
+Index management uses versioned physical indices behind aliases, enabling zero-downtime reindexing. The alias (e.g. `cars`) is what your code reads and writes through, while the actual index has a timestamped name (e.g. `cars_20260223143052`).
+
+### Initial setup
+
+```bash
+# Creates cars_20260223143052 and alias cars -> cars_20260223143052
+manage.py opensearch index create --force
+
+# Indexes documents through the alias (transparent)
+manage.py opensearch document index --force
+```
+
+### Zero-downtime reindex
+
+When you need to rebuild an index (mapping change, data migration, etc.):
+
+```bash
+# 1. Create a new version (alias still points to old index)
+manage.py opensearch index create --force
+
+# 2. Populate the new version directly
+manage.py opensearch document index --force --new-version
+
+# 3. Atomically switch the alias to the new version
+manage.py opensearch index activate --force
+
+# 4. Remove the old version
+manage.py opensearch index cleanup --force
+```
+
+During steps 1-2, all reads and real-time signal updates continue to use the old index through the alias. The switchover in step 3 is atomic.
+
+### Additional commands
+
+```bash
+# List indices with alias targets and pending versions
+manage.py opensearch index list
+
+# Keep the 2 most recent old versions during cleanup
+manage.py opensearch index cleanup --force --keep 2
+
+# Delete alias and all versioned indices
+manage.py opensearch index delete --force
+```
