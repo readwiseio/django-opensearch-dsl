@@ -1,6 +1,8 @@
+from io import StringIO
 from unittest import TestCase
 from unittest.mock import MagicMock, call, patch
 
+from django.core.management import call_command
 from opensearchpy.exceptions import NotFoundError
 
 from django_opensearch_dsl.aliases import (
@@ -182,3 +184,79 @@ class CreateAliasTestCase(TestCase):
             }
         )
         self.assertEqual(result, {"acknowledged": True})
+
+
+class MigrateIndexCommandTestCase(TestCase):
+    """Tests for the 'index migrate' management command."""
+
+    @patch("django_opensearch_dsl.management.commands.opensearch.connection")
+    @patch("django_opensearch_dsl.management.commands.opensearch.registry")
+    @patch("django_opensearch_dsl.management.commands.opensearch.generate_versioned_name")
+    @patch("django_opensearch_dsl.management.commands.opensearch.alias_exists")
+    @patch("django_opensearch_dsl.management.commands.opensearch.create_alias")
+    def test_migrate_legacy_index(self, mock_create_alias, mock_alias_exists, mock_gen_name, mock_registry, mock_conn):
+        """Legacy index is cloned, deleted, and alias created."""
+        client = MagicMock()
+        mock_conn.return_value = client
+
+        index = MagicMock()
+        index._name = "products"
+        mock_registry.get_indices.return_value = [index]
+
+        mock_alias_exists.return_value = False
+        client.indices.exists.return_value = True
+        mock_gen_name.return_value = "products_20260223143052"
+
+        out = StringIO()
+        call_command("opensearch", "index", "migrate", "--force", stdout=out, verbosity=1)
+
+        client.indices.put_settings.assert_any_call(index="products", body={"index.blocks.write": True})
+        client.indices.clone.assert_called_once_with(index="products", target="products_20260223143052")
+        client.indices.delete.assert_called_once_with(index="products")
+        mock_create_alias.assert_called_once_with(client, "products", "products_20260223143052")
+        client.indices.put_settings.assert_any_call(
+            index="products_20260223143052", body={"index.blocks.write": False}
+        )
+
+    @patch("django_opensearch_dsl.management.commands.opensearch.connection")
+    @patch("django_opensearch_dsl.management.commands.opensearch.registry")
+    @patch("django_opensearch_dsl.management.commands.opensearch.alias_exists")
+    def test_migrate_skips_already_aliased(self, mock_alias_exists, mock_registry, mock_conn):
+        """Already-aliased index is skipped."""
+        client = MagicMock()
+        mock_conn.return_value = client
+
+        index = MagicMock()
+        index._name = "products"
+        mock_registry.get_indices.return_value = [index]
+
+        mock_alias_exists.return_value = True
+
+        out = StringIO()
+        call_command("opensearch", "index", "migrate", "--force", stdout=out, verbosity=1)
+
+        client.indices.clone.assert_not_called()
+        client.indices.delete.assert_not_called()
+        self.assertIn("already using aliases", out.getvalue())
+
+    @patch("django_opensearch_dsl.management.commands.opensearch.connection")
+    @patch("django_opensearch_dsl.management.commands.opensearch.registry")
+    @patch("django_opensearch_dsl.management.commands.opensearch.alias_exists")
+    def test_migrate_skips_nonexistent_index(self, mock_alias_exists, mock_registry, mock_conn):
+        """Non-existent index is skipped."""
+        client = MagicMock()
+        mock_conn.return_value = client
+
+        index = MagicMock()
+        index._name = "products"
+        mock_registry.get_indices.return_value = [index]
+
+        mock_alias_exists.return_value = False
+        client.indices.exists.return_value = False
+
+        out = StringIO()
+        call_command("opensearch", "index", "migrate", "--force", stdout=out, verbosity=1)
+
+        client.indices.clone.assert_not_called()
+        client.indices.delete.assert_not_called()
+        self.assertIn("does not exist", out.getvalue())

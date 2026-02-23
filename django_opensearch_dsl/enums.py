@@ -12,6 +12,7 @@ class CommandAction(str, enum.Enum):
     DELETE = ("delete", "deleting", "deleted")
     ACTIVATE = ("activate", "activating", "activated")
     CLEANUP = ("cleanup", "cleaning up", "cleaned up")
+    MIGRATE = ("migrate", "migrating", "migrated")
     MANAGE = ("manage", "managing", "managed")
 
     def __new__(cls, value: str, present_participle: str, past: str) -> "CommandAction":

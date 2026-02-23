@@ -169,6 +169,8 @@ class Command(BaseCommand):
                     self._activate_index(alias_name, using, verbosity)
                 elif action == CommandAction.CLEANUP:
                     self._cleanup_indices(alias_name, using, keep, verbosity)
+                elif action == CommandAction.MIGRATE:
+                    self._migrate_index(alias_name, using, verbosity)
             except opensearchpy.exceptions.TransportError as e:
                 if verbosity or not ignore_error:
                     error = self.style.ERROR(f"Error: {e.error} - {e.info}")
@@ -251,6 +253,47 @@ class Command(BaseCommand):
                 self.stdout.write(f"  Deleted '{idx}'")
         if not to_delete and verbosity:
             self.stdout.write(f"  No old versions to clean up for '{alias_name}'")
+
+    def _migrate_index(self, alias_name: str, using: OpenSearch, verbosity: int) -> None:
+        """Migrate a legacy non-versioned index to the alias-based system.
+
+        Clones the legacy index to a versioned name, deletes the legacy index,
+        then creates an alias pointing to the versioned copy.
+        """
+        # Skip if already aliased
+        if alias_exists(using, alias_name):
+            if verbosity:
+                self.stdout.write(f"  Skipping '{alias_name}': already using aliases")
+            return
+
+        # Skip if legacy index doesn't exist
+        if not using.indices.exists(index=alias_name):
+            if verbosity:
+                self.stdout.write(f"  Skipping '{alias_name}': index does not exist")
+            return
+
+        versioned_name = generate_versioned_name(alias_name)
+
+        # Block writes on legacy index
+        using.indices.put_settings(index=alias_name, body={"index.blocks.write": True})
+
+        # Clone legacy index to versioned name
+        if verbosity:
+            self.stdout.write(f"  Cloning '{alias_name}' -> '{versioned_name}'...")
+        using.indices.clone(index=alias_name, target=versioned_name)
+
+        # Delete legacy index (frees the name for the alias)
+        if verbosity:
+            self.stdout.write(f"  Deleting legacy index '{alias_name}'...")
+        using.indices.delete(index=alias_name)
+
+        # Create alias pointing to the versioned copy
+        create_alias(using, alias_name, versioned_name)
+        if verbosity:
+            self.stdout.write(f"  Created alias '{alias_name}' -> '{versioned_name}'")
+
+        # Remove write block inherited by the cloned index
+        using.indices.put_settings(index=versioned_name, body={"index.blocks.write": False})
 
     def _manage_document(
         self,
@@ -435,13 +478,14 @@ class Command(BaseCommand):
             "action",
             type=str,
             help=(
-                "Whether you want to create, update, delete, rebuild, activate or cleanup the indices.\n"
+                "Whether you want to create, update, delete, rebuild, activate, cleanup or migrate the indices.\n"
                 "  create   - Create a new versioned index and set up alias if needed.\n"
                 "  delete   - Delete alias and all versioned physical indices.\n"
                 "  rebuild  - Delete everything and create fresh versioned index + alias.\n"
                 "  update   - Update mappings on the active physical index.\n"
                 "  activate - Atomically switch alias to newest unaliased version.\n"
-                "  cleanup  - Delete old unaliased versioned indices."
+                "  cleanup  - Delete old unaliased versioned indices.\n"
+                "  migrate  - Convert legacy non-versioned indices to alias-based system."
             ),
             choices=[
                 CommandAction.CREATE.value,
@@ -450,6 +494,7 @@ class Command(BaseCommand):
                 CommandAction.UPDATE.value,
                 CommandAction.ACTIVATE.value,
                 CommandAction.CLEANUP.value,
+                CommandAction.MIGRATE.value,
             ],
         )
         subparser.add_argument("--force", action="store_true", default=False, help="Do not ask for confirmation.")
