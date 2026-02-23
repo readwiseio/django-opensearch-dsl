@@ -1,5 +1,29 @@
 # Changelog
 
+### 0.8.0 (2025-11-24)
+
+* Add `--using` and `--database` options to the CLI to respectively specify which
+  OpenSearch and database connection to use [#87](https://github.com/Codoc-os/django-opensearch-dsl/pull/87)).
+
+**BREAKING CHANGES**:
+
+* `django_opensearch_dsl.documents.Document.get_queryset` now take an optional `alias` argument to specify which
+  database connection to use.
+* `django_opensearch_dsl.documents.Document.get_indexing_queryset` now take an optional `alias` argument to specify
+  which database connection to use.
+
+### 0.7.0 (2025-04-11)
+
+* `--refresh` and `--parallel` options of the CLI now default to the respective value of `OPENSEARCH_DSL_AUTO_REFRESH`
+  and `OPENSEARCH_DSL_AUTO_PARALLEL`.
+* Implement `get_documents()` for `DocumentRegistry` ([#74](https://github.com/Codoc-os/django-opensearch-dsl/pull/74)), 
+  Contributed by [gcarq](https://github.com/gcarq).
+* Update supported versions of Python and Django ([#75](https://github.com/Codoc-os/django-opensearch-dsl/pull/75)):
+  * Confirm support for Python 3.13.
+  * Confirm support for Django 5.1 and 5.2.
+  * Drop support for Django 3.2.  
+  Contributed by [Mariusz Felisiak](https://github.com/felixxm)
+
 ### 0.6.2 (2024-04-23)
 
 * Fix `CelerySignalProcessor` previously using `RealTimeSignalProcessor`'s method due to wrong indentation ([#66](https://github.com/Codoc-os/django-opensearch-dsl/pull/66)),

@@ -3,9 +3,9 @@ from django.utils.module_loading import autodiscover_modules
 from .documents import Document  # noqa
 from .fields import *  # noqa
 
-__version__ = "0.6.2"
+__version__ = "0.8.0"
 
 
-def autodiscover():
+def autodiscover() -> None:
     """Force the import of the `documents` modules of each `INSTALLED_APPS`."""
     autodiscover_modules("documents")
