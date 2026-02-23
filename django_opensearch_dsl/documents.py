@@ -105,26 +105,45 @@ class Document(DSLDocument):
     ) -> Iterable:
         """Divide the queryset into chunks."""
         qs = self.get_queryset(filter_=filter_, exclude=exclude, count=count, alias=alias)
-        qs = qs.order_by("pk") if not qs.query.is_sliced else qs
+        is_sliced = qs.query.is_sliced
+        qs = qs.order_by("pk") if not is_sliced else qs
         total = qs.count()
         model = self.django.model.__name__
         action = action.present_participle.title()
 
         chunk_size = self.django.queryset_pagination
-        i = 0
         done = 0
         start = time.time()
         if verbose:
             stdout.write(f"{action} {model}: 0% ({self._eta(start, done, total)})\r")
-        while done < total:
-            if verbose:
-                stdout.write(f"{action} {model}: {round(i / total * 100)}% ({self._eta(start, done, total)})\r")
 
-            for obj in qs[i : i + chunk_size]:
-                done += 1
-                yield obj
-
-            i = min(i + chunk_size, total)
+        if is_sliced:
+            # count= param slices the QS; Django forbids .filter() on sliced QS.
+            # Fall back to offset pagination (count is typically small).
+            i = 0
+            while done < total:
+                if verbose:
+                    stdout.write(f"{action} {model}: {round(done / total * 100)}% ({self._eta(start, done, total)})\r")
+                for obj in qs[i : i + chunk_size]:
+                    done += 1
+                    yield obj
+                i = min(i + chunk_size, total)
+        else:
+            # Keyset pagination: WHERE pk > last_pk ORDER BY pk LIMIT N
+            # O(chunk_size) per chunk regardless of position in the table.
+            last_pk = None
+            while done < total:
+                if verbose:
+                    stdout.write(f"{action} {model}: {round(done / total * 100)}% ({self._eta(start, done, total)})\r")
+                chunk_qs = qs.filter(pk__gt=last_pk) if last_pk is not None else qs
+                chunk_count = 0
+                for obj in chunk_qs[:chunk_size]:
+                    chunk_count += 1
+                    done += 1
+                    last_pk = obj.pk
+                    yield obj
+                if chunk_count == 0:
+                    break  # safety: concurrent deletes may reduce total
 
         if verbose:
             stdout.write(f"{action} {total} {model}: OK          \n")

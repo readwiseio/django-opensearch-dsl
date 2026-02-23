@@ -165,6 +165,29 @@ class DocumentTestCase(TestCase):
             indexing_continents = list(doc.get_indexing_queryset())
             self.assertEqual(ordered_continents, indexing_continents)
 
+    def test_get_indexing_queryset_sliced(self):
+        """Sliced querysets (count param) fall back to offset pagination."""
+        doc = ContinentDocument()
+        qs = doc.get_queryset()[:3]
+
+        with patch("django_opensearch_dsl.documents.Document.get_queryset") as mock_qs:
+            mock_qs.return_value = qs
+            result = list(doc.get_indexing_queryset())
+            self.assertEqual(len(result), min(3, Continent.objects.count()))
+            # Verify ordering is preserved
+            pks = [obj.pk for obj in result]
+            self.assertEqual(pks, sorted(pks))
+
+    def test_get_indexing_queryset_empty(self):
+        """Empty queryset returns no results."""
+        doc = ContinentDocument()
+        empty_qs = doc.get_queryset().none()
+
+        with patch("django_opensearch_dsl.documents.Document.get_queryset") as mock_qs:
+            mock_qs.return_value = empty_qs
+            result = list(doc.get_indexing_queryset())
+            self.assertEqual(result, [])
+
     def test_prepare(self):
         car = Car(name="Type 57", price=5400000.0, not_indexed="not_indexex")
         doc = CarDocument()
