@@ -45,7 +45,11 @@ setup(
     author='Quentin Coumes (Codoc)',
     author_email='coumes.quentin@gmail.com',
     url='https://github.com/qcoumes/django-opensearch-dsl',
-    packages=['django_opensearch_dsl'],
+    packages=[
+        'django_opensearch_dsl',
+        'django_opensearch_dsl.management',
+        'django_opensearch_dsl.management.commands',
+    ],
     include_package_data=True,
     install_requires=REQUIREMENTS,
     extras_require=EXTRA_REQUIREMENTS,
