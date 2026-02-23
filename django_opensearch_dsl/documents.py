@@ -11,6 +11,7 @@ from opensearchpy.helpers import bulk, parallel_bulk
 from opensearchpy.helpers.document import Document as DSLDocument
 
 from . import fields
+from .aliases import get_pending_indices
 from .apps import DODConfig
 from .enums import BulkAction, CommandAction
 from .exceptions import ModelFieldNotMappedError
@@ -275,6 +276,20 @@ class Document(DSLDocument):
 
         object_list = [thing] if isinstance(thing, models.Model) else thing
 
-        return self._bulk(
+        result = self._bulk(
             self._get_actions(object_list, action), parallel=parallel, refresh=refresh, using=using, **kwargs
         )
+
+        # Dual-write to pending (unaliased) versioned indices so that
+        # concurrent reindexing does not miss signal-driven changes.
+        if DODConfig.autosync_enabled():
+            try:
+                client = self._get_connection(using)
+                pending = get_pending_indices(client, self._index._name)
+                for pending_index in pending:
+                    patched = ({**a, "_index": pending_index} for a in self._get_actions(object_list, action))
+                    self._bulk(patched, parallel=parallel, refresh=refresh, using=using, raise_on_error=False)
+            except Exception:
+                pass  # never let pending-write failures break the primary write
+
+        return result

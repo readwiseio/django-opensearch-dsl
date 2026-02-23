@@ -1,13 +1,19 @@
-"""Stateless utility functions for OpenSearch alias management.
+"""Utility functions for OpenSearch alias management.
 
 These functions query OpenSearch for alias/index state and perform
 atomic alias operations to enable zero-downtime index deployments.
 """
 
+import time
 from datetime import datetime, timezone
 from typing import Any, Optional
 
 from opensearchpy import OpenSearch
+
+# Cache for pending (unaliased) versioned indices, keyed by alias name.
+# Each entry is (list_of_pending_indices, expires_at_monotonic).
+PENDING_INDEX_CACHE_TTL = 30  # seconds
+_pending_index_cache: dict[str, tuple[list[str], float]] = {}
 
 
 def generate_versioned_name(alias_name: str) -> str:
@@ -195,3 +201,39 @@ def create_alias(client: OpenSearch, alias_name: str, index_name: str) -> dict[s
     return client.indices.update_aliases(
         body={"actions": [{"add": {"index": index_name, "alias": alias_name}}]}
     )
+
+
+def get_pending_indices(client: OpenSearch, alias_name: str) -> list[str]:
+    """Return unaliased versioned indices, using a TTL cache.
+
+    Parameters
+    ----------
+    client : OpenSearch
+        The OpenSearch client.
+    alias_name : str
+        The alias name.
+
+    Returns
+    -------
+    list[str]
+        Cached list of unaliased physical index names.
+    """
+    now = time.monotonic()
+    cached = _pending_index_cache.get(alias_name)
+    if cached is not None:
+        indices, expires_at = cached
+        if now < expires_at:
+            return indices
+
+    indices = get_unaliased_indices(client, alias_name)
+    _pending_index_cache[alias_name] = (indices, now + PENDING_INDEX_CACHE_TTL)
+    return indices
+
+
+def clear_pending_index_cache() -> None:
+    """Clear the pending-index cache.
+
+    Call after ``activate_alias`` or cleanup operations to ensure
+    stale entries are removed.
+    """
+    _pending_index_cache.clear()

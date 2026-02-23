@@ -16,6 +16,7 @@ from opensearchpy.connection.connections import connections
 from ...aliases import (
     activate_alias,
     alias_exists,
+    clear_pending_index_cache,
     create_alias,
     generate_versioned_name,
     get_active_index,
@@ -239,6 +240,7 @@ class Command(BaseCommand):
             raise CommandError(f"No new version found for '{alias_name}'. Create one first with 'index create'.")
         old = get_active_index(using, alias_name)
         activate_alias(using, alias_name, new_index)
+        clear_pending_index_cache()
         if verbosity:
             self.stdout.write(f"  Alias '{alias_name}': '{old}' -> '{new_index}'")
 
@@ -251,6 +253,8 @@ class Command(BaseCommand):
             using.indices.delete(index=idx)
             if verbosity:
                 self.stdout.write(f"  Deleted '{idx}'")
+        if to_delete:
+            clear_pending_index_cache()
         if not to_delete and verbosity:
             self.stdout.write(f"  No old versions to clean up for '{alias_name}'")
 

@@ -1,3 +1,4 @@
+import time
 from io import StringIO
 from unittest import TestCase
 from unittest.mock import MagicMock, call, patch
@@ -6,13 +7,16 @@ from django.core.management import call_command
 from opensearchpy.exceptions import NotFoundError
 
 from django_opensearch_dsl.aliases import (
+    _pending_index_cache,
     activate_alias,
     alias_exists,
+    clear_pending_index_cache,
     create_alias,
     generate_versioned_name,
     get_active_index,
     get_alias_info,
     get_newest_unaliased_index,
+    get_pending_indices,
     get_unaliased_indices,
     get_versioned_indices,
 )
@@ -260,3 +264,212 @@ class MigrateIndexCommandTestCase(TestCase):
         client.indices.clone.assert_not_called()
         client.indices.delete.assert_not_called()
         self.assertIn("does not exist", out.getvalue())
+
+
+class GetPendingIndicesTestCase(TestCase):
+    """Tests for the pending-index cache."""
+
+    def setUp(self):
+        clear_pending_index_cache()
+
+    def tearDown(self):
+        clear_pending_index_cache()
+
+    @patch("django_opensearch_dsl.aliases.get_unaliased_indices")
+    def test_first_call_queries_opensearch(self, mock_get):
+        mock_get.return_value = ["products_20260223150000"]
+        client = MagicMock()
+
+        result = get_pending_indices(client, "products")
+
+        self.assertEqual(result, ["products_20260223150000"])
+        mock_get.assert_called_once_with(client, "products")
+
+    @patch("django_opensearch_dsl.aliases.get_unaliased_indices")
+    def test_second_call_within_ttl_uses_cache(self, mock_get):
+        mock_get.return_value = ["products_20260223150000"]
+        client = MagicMock()
+
+        get_pending_indices(client, "products")
+        result = get_pending_indices(client, "products")
+
+        self.assertEqual(result, ["products_20260223150000"])
+        mock_get.assert_called_once()  # only one call to OpenSearch
+
+    @patch("django_opensearch_dsl.aliases.get_unaliased_indices")
+    @patch("django_opensearch_dsl.aliases.time")
+    def test_call_after_ttl_refreshes(self, mock_time, mock_get):
+        mock_time.monotonic.return_value = 100.0
+        mock_get.return_value = ["products_20260223150000"]
+        client = MagicMock()
+
+        get_pending_indices(client, "products")
+        self.assertEqual(mock_get.call_count, 1)
+
+        # Advance past TTL
+        mock_time.monotonic.return_value = 131.0
+        mock_get.return_value = ["products_20260223150000", "products_20260223160000"]
+
+        result = get_pending_indices(client, "products")
+
+        self.assertEqual(result, ["products_20260223150000", "products_20260223160000"])
+        self.assertEqual(mock_get.call_count, 2)
+
+    @patch("django_opensearch_dsl.aliases.get_unaliased_indices")
+    def test_clear_cache_forces_refresh(self, mock_get):
+        mock_get.return_value = ["products_20260223150000"]
+        client = MagicMock()
+
+        get_pending_indices(client, "products")
+        clear_pending_index_cache()
+
+        mock_get.return_value = []
+        result = get_pending_indices(client, "products")
+
+        self.assertEqual(result, [])
+        self.assertEqual(mock_get.call_count, 2)
+
+    @patch("django_opensearch_dsl.aliases.get_unaliased_indices")
+    def test_returns_empty_list_when_no_pending(self, mock_get):
+        mock_get.return_value = []
+        client = MagicMock()
+
+        result = get_pending_indices(client, "products")
+        self.assertEqual(result, [])
+
+
+class DualWriteTestCase(TestCase):
+    """Tests for dual-write in Document.update()."""
+
+    @patch("django_opensearch_dsl.documents.get_pending_indices")
+    @patch("django_opensearch_dsl.apps.DODConfig.autosync_enabled")
+    def test_dual_write_to_pending_index(self, mock_autosync, mock_pending):
+        """When autosync is on and pending indices exist, _bulk is called for each."""
+        from django_opensearch_dsl.documents import Document
+
+        mock_autosync.return_value = True
+        mock_pending.return_value = ["products_20260223160000"]
+
+        doc = MagicMock(spec=Document)
+        doc._index = MagicMock()
+        doc._index._name = "products"
+        doc._get_connection = MagicMock()
+
+        # Track _bulk calls
+        bulk_calls = []
+
+        def fake_bulk(actions, **kwargs):
+            # Consume generator to capture actions
+            action_list = list(actions)
+            bulk_calls.append((action_list, kwargs))
+            return (1, [])
+
+        doc._bulk = fake_bulk
+        doc._get_actions = MagicMock(side_effect=[
+            iter([{"_index": "products", "_id": 1, "_source": {}}]),
+            iter([{"_index": "products", "_id": 1, "_source": {}}]),
+        ])
+        doc.should_index_object = MagicMock(return_value=True)
+
+        thing = MagicMock()
+        thing_list = [thing]
+
+        # Call the real update method
+        Document.update(doc, thing, action="index", refresh=False, parallel=False)
+
+        # Primary write + one pending write
+        self.assertEqual(len(bulk_calls), 2)
+        # The pending write should have patched _index
+        pending_actions = bulk_calls[1][0]
+        self.assertEqual(pending_actions[0]["_index"], "products_20260223160000")
+        # The pending write should have raise_on_error=False
+        self.assertFalse(bulk_calls[1][1]["raise_on_error"])
+
+    @patch("django_opensearch_dsl.documents.get_pending_indices")
+    @patch("django_opensearch_dsl.apps.DODConfig.autosync_enabled")
+    def test_no_dual_write_when_autosync_disabled(self, mock_autosync, mock_pending):
+        """When autosync is off, no pending-index lookup happens."""
+        from django_opensearch_dsl.documents import Document
+
+        mock_autosync.return_value = False
+
+        doc = MagicMock(spec=Document)
+        doc._index = MagicMock()
+        doc._index._name = "products"
+
+        bulk_calls = []
+
+        def fake_bulk(actions, **kwargs):
+            list(actions)
+            bulk_calls.append(kwargs)
+            return (1, [])
+
+        doc._bulk = fake_bulk
+        doc._get_actions = MagicMock(return_value=iter([{"_index": "products", "_id": 1, "_source": {}}]))
+
+        Document.update(doc, MagicMock(), action="index", refresh=False, parallel=False)
+
+        self.assertEqual(len(bulk_calls), 1)  # only primary write
+        mock_pending.assert_not_called()
+
+    @patch("django_opensearch_dsl.documents.get_pending_indices")
+    @patch("django_opensearch_dsl.apps.DODConfig.autosync_enabled")
+    def test_no_dual_write_when_no_pending(self, mock_autosync, mock_pending):
+        """When there are no pending indices, only primary write happens."""
+        from django_opensearch_dsl.documents import Document
+
+        mock_autosync.return_value = True
+        mock_pending.return_value = []
+
+        doc = MagicMock(spec=Document)
+        doc._index = MagicMock()
+        doc._index._name = "products"
+        doc._get_connection = MagicMock()
+
+        bulk_calls = []
+
+        def fake_bulk(actions, **kwargs):
+            list(actions)
+            bulk_calls.append(kwargs)
+            return (1, [])
+
+        doc._bulk = fake_bulk
+        doc._get_actions = MagicMock(return_value=iter([{"_index": "products", "_id": 1, "_source": {}}]))
+
+        Document.update(doc, MagicMock(), action="index", refresh=False, parallel=False)
+
+        self.assertEqual(len(bulk_calls), 1)  # only primary write
+
+    @patch("django_opensearch_dsl.documents.get_pending_indices")
+    @patch("django_opensearch_dsl.apps.DODConfig.autosync_enabled")
+    def test_pending_write_failure_does_not_break_primary(self, mock_autosync, mock_pending):
+        """If pending write raises, the primary result is still returned."""
+        from django_opensearch_dsl.documents import Document
+
+        mock_autosync.return_value = True
+        mock_pending.return_value = ["products_20260223160000"]
+
+        doc = MagicMock(spec=Document)
+        doc._index = MagicMock()
+        doc._index._name = "products"
+        doc._get_connection = MagicMock()
+
+        call_count = [0]
+
+        def fake_bulk(actions, **kwargs):
+            list(actions)
+            call_count[0] += 1
+            if call_count[0] == 2:
+                raise RuntimeError("OpenSearch connection failed")
+            return (1, [])
+
+        doc._bulk = fake_bulk
+        doc._get_actions = MagicMock(side_effect=[
+            iter([{"_index": "products", "_id": 1, "_source": {}}]),
+            iter([{"_index": "products", "_id": 1, "_source": {}}]),
+        ])
+
+        result = Document.update(doc, MagicMock(), action="index", refresh=False, parallel=False)
+
+        # Primary write succeeded
+        self.assertEqual(result, (1, []))
