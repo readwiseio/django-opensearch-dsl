@@ -13,6 +13,17 @@ from django.db.models import Q
 from opensearchpy import OpenSearch
 from opensearchpy.connection.connections import connections
 
+from ...aliases import (
+    activate_alias,
+    alias_exists,
+    create_alias,
+    generate_versioned_name,
+    get_active_index,
+    get_alias_info,
+    get_newest_unaliased_index,
+    get_unaliased_indices,
+    get_versioned_indices,
+)
 from ...apps import DODConfig
 from ...enums import CommandAction
 from ...registries import registry
@@ -63,16 +74,59 @@ class Command(BaseCommand):
 
         return wrap
 
+    def _get_given_indices(self, indices: list[str]) -> list:
+        """Resolve and validate index names from registry."""
+        known = registry.get_indices()
+        if indices:
+            known_name = [i._name for i in known]  # noqa
+            unknown = set(indices) - set(known_name)
+            if unknown:
+                self.stderr.write(f"Unknown indices '{list(unknown)}', choices are: '{known_name}'")
+                raise CommandError
+            return [i for i in known if i._name in indices]
+        return list(known)
+
+    def _confirm(self, action: CommandAction, given_indices: list, force: bool, verbosity: int) -> None:
+        """Display action summary and optionally ask for confirmation."""
+        if verbosity or not force:
+            self.stdout.write(f"The following indices will be {action.past}:")
+            for index in given_indices:
+                self.stdout.write(f"\t- {index._name}.")  # noqa
+            self.stdout.write("")
+        if not force:  # pragma: no cover
+            while True:
+                p = input("Continue ? [y]es [n]o : ")
+                if p.lower() in ["yes", "y"]:
+                    self.stdout.write("")
+                    break
+                elif p.lower() in ["no", "n"]:
+                    raise CommandError
+
     def __list_index(self, using: OpenSearch, **options: Any) -> None:  # noqa pragma: no cover
         """List all known index and indicate whether they are created or not."""
         indices = registry.get_indices()
         result = defaultdict(list)
         for index in indices:
+            alias_name = index._name  # noqa
             module = index._doc_types[0].__module__.split(".")[-2]  # noqa
-            exists = index.exists(using=using)
-            checkbox = f"[{'X' if exists else ' '}]"
-            count = f" ({index.search(using=using).count()} documents)" if exists else ""
-            result[module].append(f"{checkbox} {index._name}{count}")
+
+            # Check if alias exists (new versioned mode)
+            active = get_active_index(using, alias_name)
+            if active:
+                count = using.count(index=alias_name)["count"]
+                line = f"[X] {alias_name} -> {active} ({count} documents)"
+                # Show pending (unaliased) versions
+                pending = get_unaliased_indices(using, alias_name)
+                if pending:
+                    line += f" [pending: {', '.join(pending)}]"
+                result[module].append(line)
+            else:
+                # Fall back to legacy check (non-versioned index)
+                exists = index.exists(using=using)
+                checkbox = f"[{'X' if exists else ' '}]"
+                count_str = f" ({index.search(using=using).count()} documents)" if exists else ""
+                result[module].append(f"{checkbox} {alias_name}{count_str}")
+
         for app, indice_names in result.items():
             self.stdout.write(self.style.MIGRATE_LABEL(app))
             self.stdout.write("\n".join(indice_names))
@@ -85,74 +139,118 @@ class Command(BaseCommand):
         verbosity: int,
         ignore_error: bool,
         using: OpenSearch,
+        keep: int = 1,
         **options: Any,
     ) -> None:
         """Manage the creation and deletion of indices."""
         action = CommandAction(action)  # type: ignore[call-arg]
-        known = registry.get_indices()
-
-        # Filter indices
-        if indices:
-            # Ensure every given indices exists
-            known_name = [i._name for i in known]  # noqa
-            unknown = set(indices) - set(known_name)
-            if unknown:
-                self.stderr.write(f"Unknown indices '{list(unknown)}', choices are: '{known_name}'")
-                raise CommandError
-
-            # Only keep given indices
-            given_indices = [i for i in known if i._name in indices]
-        else:
-            given_indices = list(known)
-
-        # Display expected action
-        if verbosity or not force:
-            self.stdout.write(f"The following indices will be {action.past}:")
-            for index in given_indices:
-                self.stdout.write(f"\t- {index._name}.")  # noqa
-            self.stdout.write("")
-
-        # Ask for confirmation to continue
-        if not force:  # pragma: no cover
-            while True:
-                p = input("Continue ? [y]es [n]o : ")
-                if p.lower() in ["yes", "y"]:
-                    self.stdout.write("")
-                    break
-                elif p.lower() in ["no", "n"]:
-                    raise CommandError
+        given_indices = self._get_given_indices(indices)
+        self._confirm(action, given_indices, force, verbosity)
 
         pp = action.present_participle.title()
         for index in given_indices:
+            alias_name = index._name  # noqa
             if verbosity:
                 self.stdout.write(
-                    f"{pp} index '{index._name}'...\r",
+                    f"{pp} index '{alias_name}'...\r",
                     ending="",
-                )  # noqa
+                )
                 self.stdout.flush()
             try:
                 if action == CommandAction.CREATE:
-                    index.create(using=using)
+                    self._create_versioned_index(index, alias_name, using, verbosity)
                 elif action == CommandAction.DELETE:
-                    index.delete(using=using)
+                    self._delete_all_indices(alias_name, using)
                 elif action == CommandAction.UPDATE:
-                    index.put_mapping(using=using, body=index.to_dict()["mappings"])
-                else:
-                    try:
-                        index.delete(using=using)
-                    except opensearchpy.exceptions.NotFoundError:
-                        pass
-                    index.create(using=using)
+                    self._update_mapping(index, alias_name, using)
+                elif action == CommandAction.REBUILD:
+                    self._rebuild_index(index, alias_name, using)
+                elif action == CommandAction.ACTIVATE:
+                    self._activate_index(alias_name, using, verbosity)
+                elif action == CommandAction.CLEANUP:
+                    self._cleanup_indices(alias_name, using, keep, verbosity)
             except opensearchpy.exceptions.TransportError as e:
                 if verbosity or not ignore_error:
                     error = self.style.ERROR(f"Error: {e.error} - {e.info}")
-                    self.stderr.write(f"{pp} index '{index._name}'...\n{error}")  # noqa
+                    self.stderr.write(f"{pp} index '{alias_name}'...\n{error}")
                 if not ignore_error:
                     self.stderr.write("exiting...")
                     raise CommandError
             else:
                 if verbosity:
-                    self.stdout.write(f"{pp} index '{index._name}'... {self.style.SUCCESS('OK')}")  # noqa
+                    self.stdout.write(f"{pp} index '{alias_name}'... {self.style.SUCCESS('OK')}")
+
+    def _create_versioned_index(self, index: Any, alias_name: str, using: OpenSearch, verbosity: int) -> None:
+        """Create a new versioned physical index. Set up alias if none exists."""
+        versioned_name = generate_versioned_name(alias_name)
+        new_index = index.clone(name=versioned_name)
+        new_index.create(using=using)
+        if not alias_exists(using, alias_name):
+            create_alias(using, alias_name, versioned_name)
+            if verbosity:
+                self.stdout.write(f"  Created alias '{alias_name}' -> '{versioned_name}'")
+        else:
+            if verbosity:
+                self.stdout.write(f"  Created new version '{versioned_name}' (alias unchanged)")
+
+    def _delete_all_indices(self, alias_name: str, using: OpenSearch) -> None:
+        """Delete alias and all versioned + legacy physical indices."""
+        # Delete all versioned indices
+        versioned = get_versioned_indices(using, alias_name)
+        for idx in versioned:
+            using.indices.delete(index=idx)
+        # Delete alias (may fail if already gone, that's fine)
+        try:
+            if alias_exists(using, alias_name):
+                info = get_alias_info(using, alias_name)
+                for idx in info:
+                    using.indices.delete_alias(index=idx, name=alias_name)
+        except Exception:
+            pass
+        # Delete legacy non-versioned index
+        try:
+            using.indices.delete(index=alias_name)
+        except opensearchpy.exceptions.NotFoundError:
+            pass
+
+    def _update_mapping(self, index: Any, alias_name: str, using: OpenSearch) -> None:
+        """Put mapping on the active physical index."""
+        active = get_active_index(using, alias_name)
+        if active:
+            using.indices.put_mapping(index=active, body=index.to_dict()["mappings"])
+        else:
+            # Legacy fallback
+            index.put_mapping(using=using, body=index.to_dict()["mappings"])
+
+    def _rebuild_index(self, index: Any, alias_name: str, using: OpenSearch) -> None:
+        """Delete everything and create fresh versioned index + alias."""
+        self._delete_all_indices(alias_name, using)
+        versioned_name = generate_versioned_name(alias_name)
+        new_index = index.clone(name=versioned_name)
+        new_index.create(using=using)
+        create_alias(using, alias_name, versioned_name)
+
+    def _activate_index(self, alias_name: str, using: OpenSearch, verbosity: int) -> None:
+        """Atomically switch alias to newest unaliased version."""
+        new_index = get_newest_unaliased_index(using, alias_name)
+        if not new_index:
+            raise CommandError(f"No new version found for '{alias_name}'. Create one first with 'index create'.")
+        old = get_active_index(using, alias_name)
+        activate_alias(using, alias_name, new_index)
+        if verbosity:
+            self.stdout.write(f"  Alias '{alias_name}': '{old}' -> '{new_index}'")
+
+    def _cleanup_indices(self, alias_name: str, using: OpenSearch, keep: int, verbosity: int) -> None:
+        """Delete unaliased versioned indices, keeping the N most recent."""
+        unaliased = get_unaliased_indices(using, alias_name)
+        # Keep the `keep` most recent unaliased indices
+        to_delete = unaliased[:-keep] if keep > 0 else unaliased
+        for idx in to_delete:
+            using.indices.delete(index=idx)
+            if verbosity:
+                self.stdout.write(f"  Deleted '{idx}'")
+        if not to_delete and verbosity:
+            self.stdout.write(f"  No old versions to clean up for '{alias_name}'")
 
     def _manage_document(
         self,
@@ -168,6 +266,7 @@ class Command(BaseCommand):
         missing: bool,
         using: OpenSearch,
         database: str,
+        new_version: bool = False,
         **options: Any,
     ) -> None:
         """Manage the creation and deletion of indices."""
@@ -190,8 +289,32 @@ class Command(BaseCommand):
         else:
             given_indices = list(known)
 
-        # Ensure every indices needed are created
-        not_created = [i._name for i in given_indices if not i.exists(using=using)]  # noqa
+        # Resolve --new-version targets: map alias_name -> physical index name
+        new_version_targets: dict[str, str] = {}
+        if new_version:
+            for index in given_indices:
+                alias_name = index._name  # noqa
+                target = get_newest_unaliased_index(using, alias_name)
+                if not target:
+                    self.stderr.write(
+                        f"No new version found for '{alias_name}'. "
+                        f"Create one first with 'opensearch index create'."
+                    )
+                    raise CommandError
+                new_version_targets[alias_name] = target
+
+        # Ensure every indices needed are created (check alias or physical index)
+        not_created = []
+        for i in given_indices:
+            alias_name = i._name  # noqa
+            if new_version and alias_name in new_version_targets:
+                # Check that the target physical index exists
+                if not using.indices.exists(index=new_version_targets[alias_name]):
+                    not_created.append(alias_name)
+            elif alias_exists(using, alias_name):
+                continue  # alias exists, good
+            elif not i.exists(using=using):
+                not_created.append(alias_name)
         if not_created:
             self.stderr.write(f"The following indices are not created : {not_created}")
             self.stderr.write("Use 'python3 manage.py opensearch list' to list indices' state.")
@@ -235,12 +358,25 @@ class Command(BaseCommand):
         result = "\n"
         for index, kwargs in zip(given_indices, kwargs_list):
             document = index._doc_types[0]()  # noqa
-            qs = document.get_indexing_queryset(
-                stdout=self.stdout._out, verbose=verbosity, action=action, alias=database, **kwargs
-            )
-            success, errors = document.update(
-                qs, parallel=parallel, refresh=refresh, action=action, raise_on_error=False, using=using
-            )
+            alias_name = index._name  # noqa
+
+            # If --new-version, temporarily override _index._name to write to physical index
+            original_index_name = None
+            if new_version and alias_name in new_version_targets:
+                original_index_name = document._index._name  # noqa
+                document._index._name = new_version_targets[alias_name]  # noqa
+
+            try:
+                qs = document.get_indexing_queryset(
+                    stdout=self.stdout._out, verbose=verbosity, action=action, alias=database, **kwargs
+                )
+                success, errors = document.update(
+                    qs, parallel=parallel, refresh=refresh, action=action, raise_on_error=False, using=using
+                )
+            finally:
+                # Restore original name
+                if original_index_name is not None:
+                    document._index._name = original_index_name  # noqa
 
             success_str = self.style.SUCCESS(success) if success else success
             errors_str = self.style.ERROR(len(errors)) if errors else len(errors)
@@ -281,11 +417,11 @@ class Command(BaseCommand):
             help="Alias of the OpenSearch connection to use. Default to 'default'.",
         )
 
-        # 'manage' subcommand
+        # 'index' subcommand
         subparser = subparsers.add_parser(
             "index",
-            help="Manage the creation an deletion of indices.",
-            description="Manage the creation an deletion of indices.",
+            help="Manage the creation and deletion of indices.",
+            description="Manage the creation and deletion of indices.",
         )
         subparser.set_defaults(func=self._manage_index)
         subparser.add_argument(
@@ -299,20 +435,31 @@ class Command(BaseCommand):
             "action",
             type=str,
             help=(
-                "Whether you want to create, update, delete or rebuild the indices.\n"
-                "Update allow you to update your indices mappings if you modified them after creation. "
-                "This should be done prior to indexing new document with dynamic mapping (enabled by default), "
-                "a default mapping with probably the wrong type would be created for any new field."
+                "Whether you want to create, update, delete, rebuild, activate or cleanup the indices.\n"
+                "  create   - Create a new versioned index and set up alias if needed.\n"
+                "  delete   - Delete alias and all versioned physical indices.\n"
+                "  rebuild  - Delete everything and create fresh versioned index + alias.\n"
+                "  update   - Update mappings on the active physical index.\n"
+                "  activate - Atomically switch alias to newest unaliased version.\n"
+                "  cleanup  - Delete old unaliased versioned indices."
             ),
             choices=[
                 CommandAction.CREATE.value,
                 CommandAction.DELETE.value,
                 CommandAction.REBUILD.value,
                 CommandAction.UPDATE.value,
+                CommandAction.ACTIVATE.value,
+                CommandAction.CLEANUP.value,
             ],
         )
         subparser.add_argument("--force", action="store_true", default=False, help="Do not ask for confirmation.")
         subparser.add_argument("--ignore-error", action="store_true", default=False, help="Do not stop on error.")
+        subparser.add_argument(
+            "--keep",
+            type=int,
+            default=1,
+            help="Number of old versions to keep during cleanup. Default: 1.",
+        )
         subparser.add_argument(
             "indices",
             type=str,
@@ -413,6 +560,13 @@ class Command(BaseCommand):
             action="store_true",
             default=False,
             help="When used with 'index' action, only index documents not indexed yet.",
+        )
+        subparser.add_argument(
+            "--new-version",
+            action="store_true",
+            default=False,
+            dest="new_version",
+            help="Write documents to the newest unaliased version instead of through the alias.",
         )
 
         self.usage = parser.format_usage()
